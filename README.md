@@ -6,10 +6,18 @@ The script was written in Python 3.14.5 and relies on several third-party librar
 
 #### 1. System dependenices
 `python-magic` library requires libmagic library:
+
+Debian/Ubuntu: 
 ```
-Debian/Ubuntu: sudo apt install libmagic1
-Fedora: sudo dnf install file-libs
-macOS: brew install libmagic
+sudo apt install libmagic1
+```
+Fedora:
+```
+sudo dnf install file-libs
+```
+macOS:
+```
+brew install libmagic
 ```
 #### 2. Python dependenices
 Install the following python packages using pip:
