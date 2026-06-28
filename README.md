@@ -78,4 +78,4 @@ The script generates a comprehensive JSON object containing the following keys:
 * error (string): This key will only exist if a fatal parsing error occurred, detailing why the analysis failed.
 
 ### Example
-Example ELF binary taken from [TryHackMe](https://tryhackme.com/room/reverselfiles) (crackme2), as well as example json output for the same binary can be found in the [example]() folder.
+Example ELF binary taken from [TryHackMe](https://tryhackme.com/room/reverselfiles) (crackme2), as well as example json output for the same binary can be found in the [example](https://github.com/reservoir-sandbox/reverse/tree/main/example) folder.
