@@ -4,12 +4,16 @@ import sys
 import hashlib
 import math
 import re
+import os
+import asyncio
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # Third-party imports
 try:
     import magic
+    import aioboto3
+    import aiohttp
     from elftools.elf.elffile import ELFFile
     from elftools.elf.dynamic import DynamicSection
     from elftools.elf.sections import SymbolTableSection, NoteSection
@@ -297,19 +301,100 @@ def analyze_elf(filepath: Path) -> Dict[str, Any]:
 
     return analysis_results
 
-def main():
-    if len(sys.argv) != 2:
-        print(json.dumps({"error": "Usage: python3 elf_analyzer.py <path_to_elf_file>"}))
-        sys.exit(1)
-
-    target_file = Path(sys.argv[1])
+async def main():
+    # 1. Load Configurations from env variables
+    ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
+    SECRET_KEY = os.getenv("S3_SECRET_KEY")
+    ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")
+    BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+    BACKEND_CALLBACK_URL = os.getenv("BACKEND_CALLBACK_URL")
     
-    if not target_file.exists() or not target_file.is_file():
-        print(json.dumps({"error": f"File not found: {target_file}"}))
+    # Execution tracking variables
+    TASK_ID = os.getenv("TASK_ID")
+    S3_OBJECT_KEY = os.getenv("S3_OBJECT_KEY") # The path to the binary in S3
+
+    if not all([ACCESS_KEY, SECRET_KEY, ENDPOINT_URL, BUCKET_NAME, BACKEND_CALLBACK_URL, TASK_ID, S3_OBJECT_KEY]):
+        print(json.dumps({"error": "Critical configuration missing from environment variables."}))
         sys.exit(1)
 
-    results = analyze_elf(target_file)
-    print(json.dumps(results, indent=4))
+    temp_file = Path(f"/tmp/{TASK_ID}.elf")
+    session = aioboto3.Session()
+    
+    try:
+        # 2. Download Binary from S3
+        async with session.client(
+            "s3",
+            endpoint_url=ENDPOINT_URL,
+            aws_access_key_id=ACCESS_KEY,
+            aws_secret_access_key=SECRET_KEY,
+        ) as s3:
+            await s3.download_file(
+                Bucket=BUCKET_NAME,
+                Key=S3_OBJECT_KEY,
+                Filename=str(temp_file),
+            )
+        
+        # 3. Execute the core parsing routine
+        # Since this runs in an isolated single-purpose container, blocking the event loop here is safe
+        analysis_results = analyze_elf(temp_file)
+        
+        # 4. Determine delivery strategy based on size threshold (e.g., 1MB)
+        json_string = json.dumps(analysis_results)
+        payload_bytes = json_string.encode("utf-8")
+        THRESHOLD_1MB = 1024 * 1024
+        
+        callback_payload = {
+            "task_id": TASK_ID,
+            "status": "success",
+            "location": "inline"
+        }
+        
+        if len(payload_bytes) <= THRESHOLD_1MB:
+            # Send directly inline
+            callback_payload["report"] = analysis_results
+        else:
+            # Upload Report back to S3
+            output_report_key = f"reports/{TASK_ID}_report.json"
+            async with session.client(
+                "s3",
+                endpoint_url=ENDPOINT_URL,
+                aws_access_key_id=ACCESS_KEY,
+                aws_secret_access_key=SECRET_KEY,
+            ) as s3:
+                await s3.put_object(
+                    Bucket=BUCKET_NAME,
+                    Key=output_report_key,
+                    Body=payload_bytes,
+                    ContentType="application/json"
+                )
+            callback_payload["location"] = "s3"
+            callback_payload["s3_report_key"] = output_report_key
+
+        # 5. Notify backend of success
+        async with aiohttp.ClientSession() as http_session:
+            async with http_session.post(BACKEND_CALLBACK_URL, json=callback_payload) as response:
+                if response.status not in [200, 201, 202]:
+                    print(f"Failed to post success callback. HTTP Status: {response.status}")
+
+    except Exception as err:
+        # 6. Global Error Fallback - Let the backend know the job choked
+        print(f"Execution Error: {err}")
+        error_payload = {
+            "task_id": TASK_ID,
+            "status": "failed",
+            "error": str(err)
+        }
+        try:
+            async with aiohttp.ClientSession() as http_session:
+                await http_session.post(BACKEND_CALLBACK_URL, json=error_payload)
+        except Exception as network_err:
+            print(f"Failed to deliver error callback: {network_err}")
+        sys.exit(1)
+        
+    finally:
+        # Clean up local disk footprint
+        if temp_file.exists():
+            temp_file.unlink()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
