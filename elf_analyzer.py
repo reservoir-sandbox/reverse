@@ -341,7 +341,7 @@ async def main():
     
     try:
         async with session.client(
-            "s3", endpoint_url=ENDPOINT_URL, aws_access_key_id=ACCESS_KEY, aws_secret_access_key=SECRET_KEY
+            "s3", endpoint_url=ENDPOINT_URL, aws_access_key_id=ACCESS_KEY, aws_secret_access_key=SECRET_KEY, region_name="local-cluster"
         ) as s3:
             await s3.download_file(Bucket=BUCKET_NAME, Key=S3_OBJECT_KEY, Filename=str(temp_file))
         
@@ -367,7 +367,7 @@ async def main():
         else:
             output_report_key = f"reports/{TASK_ID}_report.json"
             async with session.client(
-                "s3", endpoint_url=ENDPOINT_URL, aws_access_key_id=ACCESS_KEY, aws_secret_access_key=SECRET_KEY
+                "s3", endpoint_url=ENDPOINT_URL, aws_access_key_id=ACCESS_KEY, aws_secret_access_key=SECRET_KEY, region_name="local-cluster"
             ) as s3:
                 await s3.put_object(
                     Bucket=BUCKET_NAME, Key=output_report_key, Body=payload_bytes, ContentType="application/json"
