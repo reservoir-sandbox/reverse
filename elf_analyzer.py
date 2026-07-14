@@ -6,8 +6,10 @@ import math
 import re
 import os
 import asyncio
+import mmap
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Third-party imports
 try:
@@ -28,25 +30,49 @@ def safe_str(val: Any) -> str:
         return val.decode('utf-8', errors='replace')
     return str(val)
 
-def calculate_entropy(data: bytes) -> float:
-    if not data:
-        return 0.0
-    entropy = 0.0
-    length = len(data)
+def get_hashes_and_entropy_chunked(filepath: Path) -> Tuple[Dict[str, str], float, int]:
+    md5, sha1, sha256 = hashlib.md5(), hashlib.sha1(), hashlib.sha256()
     counts = [0] * 256
-    for byte in data:
-        counts[byte] += 1
-    for count in counts:
-        if count > 0:
-            p = count / length
-            entropy -= p * math.log2(p)
-    return entropy
+    total_len = 0
+    
+    with open(filepath, 'rb') as f:
+        while chunk := f.read(1024 * 1024): 
+            md5.update(chunk)
+            sha1.update(chunk)
+            sha256.update(chunk)
+            total_len += len(chunk)
+            for byte in chunk:
+                counts[byte] += 1
+                
+    entropy = 0.0
+    if total_len > 0:
+        for count in counts:
+            if count > 0:
+                p = count / total_len
+                entropy -= p * math.log2(p)
+                
+    hashes = {
+        "md5": md5.hexdigest(),
+        "sha1": sha1.hexdigest(),
+        "sha256": sha256.hexdigest()
+    }
+    return hashes, entropy, total_len
 
-def get_file_hashes(data: bytes) -> Dict[str, str]:
+def extract_strings_mmap(mm: mmap.mmap, min_length: int = 6, max_strings: int = 2000) -> Dict[str, Any]:
+    pattern = re.compile(b'[ -~]{%d,}' % min_length)
+    decoded_strings = set()
+    truncated = False
+    
+    for match in pattern.finditer(mm):
+        decoded_strings.add(match.group(0).decode('ascii', errors='ignore'))
+        if len(decoded_strings) >= max_strings:
+            truncated = True
+            break
+            
     return {
-        "md5": hashlib.md5(data).hexdigest(),
-        "sha1": hashlib.sha1(data).hexdigest(),
-        "sha256": hashlib.sha256(data).hexdigest()
+        "total_unique_strings_found": len(decoded_strings),
+        "strings": list(decoded_strings),
+        "truncated": truncated
     }
 
 def extract_build_id(elf: ELFFile) -> Optional[str]:
@@ -67,7 +93,6 @@ def extract_compiler_info(elf: ELFFile) -> List[str]:
                 compilers.add(part.strip())
     return list(compilers)
 
-    # Check for standard binary exploit mitigations
 def analyze_security_mitigations(elf: ELFFile, symbols_dict: Dict[str, List[Dict]]) -> Dict[str, Any]:
     mitigations = {
         "nx": False,
@@ -76,35 +101,28 @@ def analyze_security_mitigations(elf: ELFFile, symbols_dict: Dict[str, List[Dict
         "stack_canary": False
     }
     
-    # Non-executable stack (nx)
     for segment in elf.iter_segments():
         if segment['p_type'] == 'PT_GNU_STACK':
-            # PF_X (executable) flag is 1
             if not (segment['p_flags'] & 1): 
                 mitigations["nx"] = True
             break
             
-    # Position independent executable (pie)
     if elf.header['e_type'] == 'ET_DYN':
         mitigations["pie"] = True
         
-    # Relocation read-only (relro)
     has_relro = any(seg['p_type'] == 'PT_GNU_RELRO' for seg in elf.iter_segments())
     bind_now = False
     dynamic = elf.get_section_by_name('.dynamic')
     if dynamic:
         for tag in dynamic.iter_tags():
-            if tag.entry.d_tag == 'DT_BIND_NOW':
-                bind_now = True
-            elif tag.entry.d_tag == 'DT_FLAGS' and (tag.entry.d_val & 0x8): # DF_BIND_NOW
-                bind_now = True
-            elif tag.entry.d_tag == 'DT_FLAGS_1' and (tag.entry.d_val & 0x1): # DF_1_NOW
+            if tag.entry.d_tag == 'DT_BIND_NOW' or \
+               (tag.entry.d_tag == 'DT_FLAGS' and (tag.entry.d_val & 0x8)) or \
+               (tag.entry.d_tag == 'DT_FLAGS_1' and (tag.entry.d_val & 0x1)):
                 bind_now = True
                 
     if has_relro:
         mitigations["relro"] = "Full RELRO" if bind_now else "Partial RELRO"
         
-    # Stack canary
     all_symbols = symbols_dict.get("imported", []) + symbols_dict.get("internal", [])
     for sym in all_symbols:
         if "__stack_chk_fail" in sym["name"]:
@@ -113,40 +131,18 @@ def analyze_security_mitigations(elf: ELFFile, symbols_dict: Dict[str, List[Dict
             
     return mitigations
 
-    # Emulate 'strings' cmd and limit output
-def extract_strings(data: bytes, min_length: int = 6, max_strings: int = 2000) -> Dict[str, Any]:
-    # Regex looks for contiguous printable ASCII characters
-    pattern = re.compile(b'[ -~]{%d,}' % min_length)
-    matches = pattern.findall(data)
-    
-    # Decode, deduplicate and limit
-    decoded_strings = list({m.decode('ascii', errors='ignore') for m in matches})
-    
-    return {
-        "total_unique_strings_found": len(decoded_strings),
-        "strings": decoded_strings[:max_strings],
-        "truncated": len(decoded_strings) > max_strings
-    }
-
 def get_capstone_disassembler(elf: ELFFile) -> Optional[Cs]:
     arch = elf.header['e_machine']
-    
-    if arch == 'EM_X86_64':
-        return Cs(CS_ARCH_X86, CS_MODE_64)
-    elif arch == 'EM_386':
-        return Cs(CS_ARCH_X86, CS_MODE_32)
-    elif arch == 'EM_ARM':
-        return Cs(CS_ARCH_ARM, CS_MODE_ARM)
-    elif arch == 'EM_AARCH64':
-        return Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+    if arch == 'EM_X86_64': return Cs(CS_ARCH_X86, CS_MODE_64)
+    elif arch == 'EM_386': return Cs(CS_ARCH_X86, CS_MODE_32)
+    elif arch == 'EM_ARM': return Cs(CS_ARCH_ARM, CS_MODE_ARM)
+    elif arch == 'EM_AARCH64': return Cs(CS_ARCH_ARM64, CS_MODE_ARM)
     elif arch == 'EM_MIPS':
         elf_class = elf.header['e_ident']['EI_CLASS']
         mode = CS_MODE_MIPS64 if elf_class == 'ELFCLASS64' else CS_MODE_MIPS32
         return Cs(CS_ARCH_MIPS, mode)
     return None
 
-
-    # Emulate 'objdump -d'
 def disassemble_entry_point(elf: ELFFile, raw_data: bytes, max_instructions: int = 50) -> Dict[str, Any]:
     entry_point = elf.header.get('e_entry', 0)
     if entry_point == 0:
@@ -156,7 +152,6 @@ def disassemble_entry_point(elf: ELFFile, raw_data: bytes, max_instructions: int
     if not md:
         return {"error": f"Unsupported architecture for disassembly: {elf.header['e_machine']}"}
 
-    # Find which segment contains the entry point to translate vaddr to file offset
     entry_offset = -1
     for segment in elf.iter_segments():
         if segment['p_type'] == 'PT_LOAD':
@@ -169,9 +164,7 @@ def disassemble_entry_point(elf: ELFFile, raw_data: bytes, max_instructions: int
     if entry_offset == -1:
         return {"error": "Entry point does not map to any loadable segment"}
 
-    # Extract bytes starting from the entry point
     code_chunk = raw_data[entry_offset:entry_offset + (max_instructions * 15)]
-    
     instructions = []
     try:
         for i in md.disasm(code_chunk, entry_point):
@@ -193,16 +186,10 @@ def disassemble_entry_point(elf: ELFFile, raw_data: bytes, max_instructions: int
         "instructions": instructions
     }
 
-def analyze_elf(filepath: Path) -> Dict[str, Any]:
-    try:
-        raw_data = filepath.read_bytes()
-    except IOError as e:
-        return {"error": f"Failed to read file: {e}"}
-
+def analyze_elf(filepath: Path, original_filename: str) -> Dict[str, Any]:
     analysis_results: Dict[str, Any] = {
-        "filename": filepath.name,
+        "filename": original_filename,
         "filepath": str(filepath.absolute()),
-        "file_size_bytes": len(raw_data),
         "metadata": {},
         "header": {},
         "sections": [],
@@ -216,83 +203,97 @@ def analyze_elf(filepath: Path) -> Dict[str, Any]:
         "compiler_info": []
     }
 
-    analysis_results["metadata"]["hashes"] = get_file_hashes(raw_data)
-    analysis_results["metadata"]["overall_entropy"] = calculate_entropy(raw_data)
     try:
-        analysis_results["metadata"]["magic_type"] = magic.from_buffer(raw_data)
-        analysis_results["metadata"]["mime_type"] = magic.from_buffer(raw_data, mime=True)
-    except Exception as e:
-        analysis_results["metadata"]["magic_type"] = f"libmagic error: {e}"
+        hashes, entropy, size = get_hashes_and_entropy_chunked(filepath)
+        analysis_results["file_size_bytes"] = size
+        analysis_results["metadata"]["hashes"] = hashes
+        analysis_results["metadata"]["overall_entropy"] = entropy
 
-    analysis_results["strings_analysis"] = extract_strings(raw_data, min_length=6, max_strings=2000)
+        if size == 0:
+            analysis_results["error"] = "File is empty"
+            return analysis_results
 
-    try:
         with filepath.open('rb') as f:
-            elf = ELFFile(f)
+            with mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ) as mm:
+                
+                try:
+                    analysis_results["metadata"]["magic_type"] = magic.from_buffer(mm[:2048])
+                    analysis_results["metadata"]["mime_type"] = magic.from_buffer(mm[:2048], mime=True)
+                except Exception as e:
+                    analysis_results["metadata"]["magic_type"] = f"libmagic error: {e}"
 
-            header = elf.header
-            analysis_results["header"] = {
-                "magic": safe_str(header.get('e_ident', {}).get('EI_MAG', '')),
-                "class": safe_str(header.get('e_ident', {}).get('EI_CLASS', '')),
-                "data_encoding": safe_str(header.get('e_ident', {}).get('EI_DATA', '')),
-                "os_abi": safe_str(header.get('e_ident', {}).get('EI_OSABI', '')),
-                "type": safe_str(header.get('e_type', '')),
-                "machine": safe_str(header.get('e_machine', '')),
-                "entry_point": hex(header.get('e_entry', 0))
-            }
+                analysis_results["strings_analysis"] = extract_strings_mmap(mm, min_length=6, max_strings=2000)
 
-            analysis_results["disassembly"] = disassemble_entry_point(elf, raw_data, max_instructions=50)
+                elf = ELFFile(f)
 
-            for section in elf.iter_sections():
-                analysis_results["sections"].append({
-                    "name": safe_str(section.name),
-                    "type": safe_str(section['sh_type']),
-                    "address": hex(section['sh_addr']),
-                    "size_bytes": section['sh_size'],
-                    "entropy": calculate_entropy(section.data()),
-                })
+                header = elf.header
+                analysis_results["header"] = {
+                    "magic": safe_str(header.get('e_ident', {}).get('EI_MAG', '')),
+                    "class": safe_str(header.get('e_ident', {}).get('EI_CLASS', '')),
+                    "data_encoding": safe_str(header.get('e_ident', {}).get('EI_DATA', '')),
+                    "os_abi": safe_str(header.get('e_ident', {}).get('EI_OSABI', '')),
+                    "type": safe_str(header.get('e_type', '')),
+                    "machine": safe_str(header.get('e_machine', '')),
+                    "entry_point": hex(header.get('e_entry', 0))
+                }
 
-            for segment in elf.iter_segments():
-                analysis_results["segments"].append({
-                    "type": safe_str(segment['p_type']),
-                    "virtual_address": hex(segment['p_vaddr']),
-                    "memory_size_bytes": segment['p_memsz'],
-                    "flags": hex(segment['p_flags'])
-                })
+                entry_point = header.get('e_entry', 0)
+                if entry_point != 0:
+                     analysis_results["disassembly"] = disassemble_entry_point(elf, mm, max_instructions=50)
 
-            dynamic_section = elf.get_section_by_name('.dynamic')
-            if isinstance(dynamic_section, DynamicSection):
-                for tag in dynamic_section.iter_tags():
-                    if tag.entry.d_tag == 'DT_NEEDED':
-                        analysis_results["libraries"].append(safe_str(tag.needed))
+                for section in elf.iter_sections():
+                    sec_data = section.data()
+                    entropy_val = 0.0
+                    if sec_data:
+                        counts = [0] * 256
+                        for b in sec_data: counts[b] += 1
+                        for c in counts:
+                            if c > 0:
+                                p = c / len(sec_data)
+                                entropy_val -= p * math.log2(p)
+                                
+                    analysis_results["sections"].append({
+                        "name": safe_str(section.name),
+                        "type": safe_str(section['sh_type']),
+                        "address": hex(section['sh_addr']),
+                        "size_bytes": section['sh_size'],
+                        "entropy": entropy_val,
+                    })
 
-            dynsym = elf.get_section_by_name('.dynsym')
-            if dynsym:
-                for symbol in dynsym.iter_symbols():
-                    if not symbol.name:
-                        continue
-                        
-                    sym_info = {
-                        "name": safe_str(symbol.name),
-                        "value": hex(symbol['st_value']),
-                        "type": safe_str(symbol['st_info']['type']),
-                        "bind": safe_str(symbol['st_info']['bind'])
-                    }
-                    
-                    # SHN_UNDEF in the dynamic symbol table indicates an external import
-                    if symbol['st_shndx'] == 'SHN_UNDEF':
-                        analysis_results["symbols"]["imported"].append(sym_info)
-                    # Global or weak symbols defined in the binary are exported
-                    elif sym_info["bind"] == "STB_GLOBAL" and symbol['st_shndx'] != 'SHN_UNDEF':
-                        analysis_results["symbols"]["exported"].append(sym_info)
-                    elif sym_info["name"]:
-                        analysis_results["symbols"]["internal"].append(sym_info)
+                for segment in elf.iter_segments():
+                    analysis_results["segments"].append({
+                        "type": safe_str(segment['p_type']),
+                        "virtual_address": hex(segment['p_vaddr']),
+                        "memory_size_bytes": segment['p_memsz'],
+                        "flags": hex(segment['p_flags'])
+                    })
 
-            analysis_results["build_id"] = extract_build_id(elf)
-            
-            analysis_results["compiler_info"] = extract_compiler_info(elf)
+                dynamic_section = elf.get_section_by_name('.dynamic')
+                if isinstance(dynamic_section, DynamicSection):
+                    for tag in dynamic_section.iter_tags():
+                        if tag.entry.d_tag == 'DT_NEEDED':
+                            analysis_results["libraries"].append(safe_str(tag.needed))
 
-            analysis_results["security_mitigations"] = analyze_security_mitigations(elf, analysis_results["symbols"])
+                dynsym = elf.get_section_by_name('.dynsym')
+                if dynsym:
+                    for symbol in dynsym.iter_symbols():
+                        if not symbol.name: continue
+                        sym_info = {
+                            "name": safe_str(symbol.name),
+                            "value": hex(symbol['st_value']),
+                            "type": safe_str(symbol['st_info']['type']),
+                            "bind": safe_str(symbol['st_info']['bind'])
+                        }
+                        if symbol['st_shndx'] == 'SHN_UNDEF':
+                            analysis_results["symbols"]["imported"].append(sym_info)
+                        elif sym_info["bind"] in ("STB_GLOBAL", "STB_WEAK") and symbol['st_shndx'] != 'SHN_UNDEF':
+                            analysis_results["symbols"]["exported"].append(sym_info)
+                        elif sym_info["name"]:
+                            analysis_results["symbols"]["internal"].append(sym_info)
+
+                analysis_results["build_id"] = extract_build_id(elf)
+                analysis_results["compiler_info"] = extract_compiler_info(elf)
+                analysis_results["security_mitigations"] = analyze_security_mitigations(elf, analysis_results["symbols"])
 
     except ELFError as e:
         analysis_results["error"] = f"File is not a valid ELF or is corrupted: {e}"
@@ -301,100 +302,113 @@ def analyze_elf(filepath: Path) -> Dict[str, Any]:
 
     return analysis_results
 
+def get_iso_time() -> str:
+    """Returns strict ISO-8601 UTC time (e.g., 2026-07-14T20:01:43.123Z)"""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
 async def main():
-    # 1. Load Configurations from env variables
+    # Capture start time immediately
+    started_at = get_iso_time()
+    
     ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
     SECRET_KEY = os.getenv("S3_SECRET_KEY")
     ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")
     BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
-    BACKEND_CALLBACK_URL = os.getenv("BACKEND_CALLBACK_URL")
     
-    # Execution tracking variables
+    # Updated Env Vars
+    BACKEND_CALLBACK_URL = os.getenv("BACKEND_CALLBACK_URL")
+    WORKER_CALLBACK_SECRET = os.getenv("WORKER_CALLBACK_SECRET")
     TASK_ID = os.getenv("TASK_ID")
-    S3_OBJECT_KEY = os.getenv("S3_OBJECT_KEY") # The path to the binary in S3
+    S3_OBJECT_KEY = os.getenv("S3_OBJECT_KEY")
 
-    if not all([ACCESS_KEY, SECRET_KEY, ENDPOINT_URL, BUCKET_NAME, BACKEND_CALLBACK_URL, TASK_ID, S3_OBJECT_KEY]):
+    if not all([ACCESS_KEY, SECRET_KEY, ENDPOINT_URL, BUCKET_NAME, BACKEND_CALLBACK_URL, WORKER_CALLBACK_SECRET, TASK_ID, S3_OBJECT_KEY]):
         print(json.dumps({"error": "Critical configuration missing from environment variables."}))
         sys.exit(1)
 
+    if not BACKEND_CALLBACK_URL.endswith(f"/callback"):
+        callback_url = f"{BACKEND_CALLBACK_URL.rstrip('/')}/api/v1/internal/tasks/{TASK_ID}/callback"
+    else:
+        callback_url = BACKEND_CALLBACK_URL
+
+    http_headers = {
+        "X-Worker-Token": WORKER_CALLBACK_SECRET,
+        "Content-Type": "application/json"
+    }
+
     temp_file = Path(f"/tmp/{TASK_ID}.elf")
+    original_filename = Path(S3_OBJECT_KEY).name
     session = aioboto3.Session()
     
     try:
-        # 2. Download Binary from S3
         async with session.client(
-            "s3",
-            endpoint_url=ENDPOINT_URL,
-            aws_access_key_id=ACCESS_KEY,
-            aws_secret_access_key=SECRET_KEY,
+            "s3", endpoint_url=ENDPOINT_URL, aws_access_key_id=ACCESS_KEY, aws_secret_access_key=SECRET_KEY
         ) as s3:
-            await s3.download_file(
-                Bucket=BUCKET_NAME,
-                Key=S3_OBJECT_KEY,
-                Filename=str(temp_file),
-            )
+            await s3.download_file(Bucket=BUCKET_NAME, Key=S3_OBJECT_KEY, Filename=str(temp_file))
         
-        # 3. Execute the core parsing routine
-        # Since this runs in an isolated single-purpose container, blocking the event loop here is safe
-        analysis_results = analyze_elf(temp_file)
+        analysis_results = await asyncio.wait_for(
+            asyncio.to_thread(analyze_elf, temp_file, original_filename),
+            timeout=300.0 
+        )
         
-        # 4. Determine delivery strategy based on size threshold (e.g., 1MB)
         json_string = json.dumps(analysis_results)
         payload_bytes = json_string.encode("utf-8")
         THRESHOLD_1MB = 1024 * 1024
         
+        finished_at = get_iso_time()
+        
         callback_payload = {
-            "task_id": TASK_ID,
-            "status": "success",
-            "location": "inline"
+            "status": "completed",
+            "started_at": started_at,
+            "finished_at": finished_at
         }
         
         if len(payload_bytes) <= THRESHOLD_1MB:
-            # Send directly inline
-            callback_payload["report"] = analysis_results
+            callback_payload["result"] = analysis_results
         else:
-            # Upload Report back to S3
             output_report_key = f"reports/{TASK_ID}_report.json"
             async with session.client(
-                "s3",
-                endpoint_url=ENDPOINT_URL,
-                aws_access_key_id=ACCESS_KEY,
-                aws_secret_access_key=SECRET_KEY,
+                "s3", endpoint_url=ENDPOINT_URL, aws_access_key_id=ACCESS_KEY, aws_secret_access_key=SECRET_KEY
             ) as s3:
                 await s3.put_object(
-                    Bucket=BUCKET_NAME,
-                    Key=output_report_key,
-                    Body=payload_bytes,
-                    ContentType="application/json"
+                    Bucket=BUCKET_NAME, Key=output_report_key, Body=payload_bytes, ContentType="application/json"
                 )
-            callback_payload["location"] = "s3"
-            callback_payload["s3_report_key"] = output_report_key
+            callback_payload["report_object_name"] = output_report_key
 
-        # 5. Notify backend of success
-        async with aiohttp.ClientSession() as http_session:
-            async with http_session.post(BACKEND_CALLBACK_URL, json=callback_payload) as response:
-                if response.status not in [200, 201, 202]:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as http_session:
+            async with http_session.post(callback_url, headers=http_headers, json=callback_payload) as response:
+                if response.status not in [200, 201, 202, 204]:
                     print(f"Failed to post success callback. HTTP Status: {response.status}")
+                    body = await response.text()
+                    print(f"Backend response: {body}")
 
+    except asyncio.TimeoutError:
+        error_msg = "Analysis timed out (exceeded 5 minutes). Possible decompression bomb."
+        print(error_msg)
+        await send_error_callback(callback_url, http_headers, error_msg, started_at)
     except Exception as err:
-        # 6. Global Error Fallback - Let the backend know the job choked
         print(f"Execution Error: {err}")
-        error_payload = {
-            "task_id": TASK_ID,
-            "status": "failed",
-            "error": str(err)
-        }
-        try:
-            async with aiohttp.ClientSession() as http_session:
-                await http_session.post(BACKEND_CALLBACK_URL, json=error_payload)
-        except Exception as network_err:
-            print(f"Failed to deliver error callback: {network_err}")
+        await send_error_callback(callback_url, http_headers, str(err), started_at)
         sys.exit(1)
         
     finally:
-        # Clean up local disk footprint
         if temp_file.exists():
             temp_file.unlink()
+
+async def send_error_callback(url: str, headers: dict, error_msg: str, started_at: str):
+    finished_at = get_iso_time()
+    error_payload = {
+        "status": "failed",
+        "error": error_msg,
+        "started_at": started_at,
+        "finished_at": finished_at
+    }
+    timeout = aiohttp.ClientTimeout(total=30)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as http_session:
+            await http_session.post(url, headers=headers, json=error_payload)
+    except Exception as network_err:
+        print(f"Failed to deliver error callback: {network_err}")
 
 if __name__ == "__main__":
     asyncio.run(main())
