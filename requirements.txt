@@ -1,5 +1,5 @@
 pyelftools==0.31
-capstone==5.0.1
+capstone>=5.0.9
 python-magic==0.4.27
 aioboto3==13.0.0
 aiohttp==3.10.0
